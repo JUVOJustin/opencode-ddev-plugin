@@ -28,17 +28,24 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
   };
 
   /**
-   * Extracts DDEV project path from `ddev describe` output
+   * Extracts DDEV project path from JSON describe output
    */
-  const extractProjectPath = (ddevOutput: string): string | null => {
-    const projectLineMatch = ddevOutput.match(/Project:\s+\S+\s+([^\s]+)/);
+  const extractProjectPath = (jsonOutput: string): string | null => {
+    try {
+      const data = JSON.parse(jsonOutput);
+      
+      // The project path is in the "raw.shortroot" or "raw.approot" field
+      const projectPath = data?.raw?.shortroot || data?.raw?.approot;
+      
+      if (!projectPath) {
+        return null;
+      }
 
-    if (!projectLineMatch) {
+      return expandHomePath(projectPath);
+    } catch (error) {
+      console.error(`Failed to parse DDEV JSON output: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
-
-    const rawPath = projectLineMatch[1].trim();
-    return expandHomePath(rawPath);
   };
 
   /**
@@ -88,7 +95,7 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
    */
   const checkDdevAvailability = async (): Promise<void> => {
     try {
-      const result = await $`ddev describe`.quiet().nothrow();
+      const result = await $`ddev describe -j`.quiet().nothrow();
 
       if (result.exitCode !== 0) {
         isDdevAvailable = false;
