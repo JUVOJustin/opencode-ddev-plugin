@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import { createDdevLogsTool } from "./logs";
 
 /**
  * DDEV Plugin for OpenCode
@@ -9,11 +10,18 @@ import type { Plugin } from "@opencode-ai/plugin";
 export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktree }) => {
   const CONTAINER_ROOT = '/var/www/html' as const;
   const HOST_ONLY_COMMANDS = ['git', 'gh', 'docker', 'ddev'] as const;
+  const CACHE_DURATION_MS = 120000; // 2 minutes
 
-  let isDdevAvailable = false;
+  type DdevStatus = {
+    available: boolean;    // Is DDEV installed and configured for this project?
+    running: boolean;      // Is DDEV currently running?
+  };
+
+  let lastCheck: { timestamp: number; status: DdevStatus } | null = null;
   let containerWorkingDir: string = CONTAINER_ROOT;
   let currentSessionId: string | null = null;
   let hasNotifiedSession = false;
+  let hasAskedToStart = false;
 
   /**
    * Expands tilde (~) in path to full home directory
@@ -28,23 +36,23 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
   };
 
   /**
-   * Extracts DDEV project path from JSON describe output
+   * Extracts DDEV project path and status from JSON describe output
    */
-  const extractProjectPath = (jsonOutput: string): string | null => {
+  const extractProjectInfo = (jsonOutput: string): { path: string | null; status: string | null } => {
     try {
       const data = JSON.parse(jsonOutput);
-      
+
       // The project path is in the "raw.shortroot" or "raw.approot" field
       const projectPath = data?.raw?.shortroot || data?.raw?.approot;
-      
-      if (!projectPath) {
-        return null;
-      }
+      const status = data?.raw?.status;
 
-      return expandHomePath(projectPath);
+      return {
+        path: projectPath ? expandHomePath(projectPath) : null,
+        status: status || null,
+      };
     } catch (error) {
       console.error(`Failed to parse DDEV JSON output: ${error instanceof Error ? error.message : String(error)}`);
-      return null;
+      return { path: null, status: null };
     }
   };
 
@@ -65,6 +73,29 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
     }
 
     return `${CONTAINER_ROOT}/${relativePath}`;
+  };
+
+  /**
+   * Add to context that ddev can be started
+   */
+  const askToStartDdev = async (): Promise<void> => {
+    if (hasAskedToStart || !currentSessionId) {
+      return;
+    }
+
+    await client.session.prompt({
+      path: { id: currentSessionId },
+      body: {
+        parts: [
+          {
+            type: 'text',
+            text: '⚠️  DDEV environment is stopped. Start it using `ddev start`?',
+          },
+        ],
+        noReply: true,
+      },
+    });
+    hasAskedToStart = true;
   };
 
   /**
@@ -91,32 +122,61 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
   };
 
   /**
-   * Checks if DDEV is available and configures path mapping
+   * Checks DDEV availability and status
+   * Uses caching to avoid repeated checks (cache expires after 1 minute)
+   * 
+   * Returns:
+   * - available: true if DDEV is installed and configured for this project
+   * - running: true if DDEV containers are currently running
+   * 
+   * Side effects when running:
+   * - Sets containerWorkingDir based on project path
    */
-  const checkDdevAvailability = async (): Promise<void> => {
+  async function checkDdevStatus(): Promise<DdevStatus> {
+    // Return cached status if still valid
+    const now = Date.now();
+    if (lastCheck && now - lastCheck.timestamp < CACHE_DURATION_MS) {
+      return lastCheck.status;
+    }
+
+    // Perform the check
     try {
       const result = await $`ddev describe -j`.quiet().nothrow();
 
+      // DDEV not available (not installed or no project)
       if (result.exitCode !== 0) {
-        isDdevAvailable = false;
-        return;
+        const status: DdevStatus = { available: false, running: false };
+        lastCheck = null; // Don't cache failures
+        return status;
       }
 
-      isDdevAvailable = true;
       const output = result.stdout.toString();
-      const projectRoot = extractProjectPath(output);
+      const { path: projectRoot, status: projectStatus } = extractProjectInfo(output);
 
-      if (!projectRoot) {
-        containerWorkingDir = CONTAINER_ROOT;
-        return;
+      // DDEV is available but stopped
+      if (projectStatus === 'stopped') {
+        const status: DdevStatus = { available: true, running: false };
+        lastCheck = null; // Don't cache stopped state
+        return status;
       }
 
-      containerWorkingDir = mapToContainerPath(directory, projectRoot);
+      // DDEV is available and running - configure paths
+      if (projectRoot) {
+        containerWorkingDir = mapToContainerPath(directory, projectRoot);
+      } else {
+        containerWorkingDir = CONTAINER_ROOT;
+      }
+
+      const status: DdevStatus = { available: true, running: true };
+      lastCheck = { timestamp: now, status };
+      return status;
     } catch (error) {
-      isDdevAvailable = false;
-      console.error(`DDEV availability check failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`DDEV status check failed: ${error instanceof Error ? error.message : String(error)}`);
+      const status: DdevStatus = { available: false, running: false };
+      lastCheck = null;
+      return status;
     }
-  };
+  }
 
   /**
    * Determines if command should run on host instead of container
@@ -163,23 +223,20 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
     return `ddev exec --dir="${containerWorkingDir}" bash -c ${escapedCommand}`;
   };
 
-  // Initialize DDEV detection
-  await checkDdevAvailability();
+  // Initialize DDEV detection (initial check)
+  const initialStatus = await checkDdevStatus();
 
   return {
     event: async ({ event }) => {
       if (event.type === 'session.created') {
         currentSessionId = event.properties.info.id;
         hasNotifiedSession = false;
+        hasAskedToStart = false;
       }
     },
 
     'tool.execute.before': async (input, output) => {
       if (input.tool !== 'bash') {
-        return;
-      }
-
-      if (!isDdevAvailable) {
         return;
       }
 
@@ -189,7 +246,26 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
         return;
       }
 
-      // Notify LLM about DDEV environment on first wrapped command execution
+      // Check DDEV status (with caching)
+      const status = await checkDdevStatus();
+
+      // DDEV not available at all - exit early
+      if (!status.available) {
+        return;
+      }
+
+      // DDEV available but stopped - ask user to start it
+      if (!status.running && !hasAskedToStart) {
+        await askToStartDdev();
+        return;
+      }
+
+      // DDEV not running - don't wrap commands
+      if (!status.running) {
+        return;
+      }
+
+      // DDEV is running - notify and wrap command
       if (!hasNotifiedSession) {
         await notifyDdevInSession();
       }
@@ -208,5 +284,12 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
         });
       }
     },
+
+    // Register custom tools only if DDEV project exists (running or stopped)
+    ...(initialStatus.available ? {
+      tool: {
+        ddev_logs: createDdevLogsTool($),
+      },
+    } : {}),
   };
 };
