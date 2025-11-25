@@ -1,6 +1,6 @@
 # opencode-ddev-plugin
 
-DDEV Plugin for OpenCode - Automatically detects DDEV availability and wraps bash commands to execute inside the DDEV container.
+DDEV Plugin for [OpenCode](https://opencode.ai) - Automatically detects DDEV availability and wraps bash commands to execute inside the DDEV container.
 
 ## Features
 
