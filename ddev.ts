@@ -156,18 +156,20 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
       return relativePath;
     });
 
-    // Replace any remaining project root paths with container paths
-    const projectRootRegex = new RegExp(
-      escapeRegex(projectRoot) + '(/[^\\s"\']*|(?=[\\s"\']|$))',
-      'g'
-    );
+    // Replace any remaining project root paths with container paths (skip if same as hostWorkingDir)
+    if (hostWorkingDir !== projectRoot) {
+      const projectRootRegex = new RegExp(
+        escapeRegex(projectRoot) + '(/[^\\s"\']*|(?=[\\s"\']|$))',
+        'g'
+      );
 
-    cleanedCommand = cleanedCommand.replace(projectRootRegex, (match, suffix) => {
-      if (!suffix) {
-        return CONTAINER_ROOT;
-      }
-      return `${CONTAINER_ROOT}${suffix}`;
-    });
+      cleanedCommand = cleanedCommand.replace(projectRootRegex, (match, suffix) => {
+        if (!suffix) {
+          return CONTAINER_ROOT;
+        }
+        return `${CONTAINER_ROOT}${suffix}`;
+      });
+    }
 
     // Remove redundant "cd . &&" prefix (result of cd to current working dir)
     cleanedCommand = cleanedCommand.replace(/^\s*cd\s+(?:\.|(["'])\.?\1)\s*&&\s*/, '');
@@ -224,6 +226,19 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
   };
 
   /**
+   * Logs a message using OpenCode's app-level logging
+   */
+  const log = async (level: 'debug' | 'info' | 'warn' | 'error', message: string): Promise<void> => {
+    await client.app.log({
+      body: {
+        service: 'ddev-plugin',
+        level,
+        message,
+      },
+    });
+  };
+
+  /**
    * Fetches and caches DDEV project data.
    * Uses caching to avoid repeated checks (cache expires after 2 minutes).
    * Only caches when DDEV is running; stopped/unavailable states are not cached.
@@ -246,7 +261,16 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
       }
 
       const output = result.stdout.toString();
-      const data = JSON.parse(output);
+
+      let data;
+      try {
+        data = JSON.parse(output);
+      } catch (parseError) {
+        await log('error', `Failed to parse DDEV JSON output: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
+        ddevCache = null;
+        return;
+      }
+
       const raw = data?.raw as DdevRawData | undefined;
 
       if (!raw) {
@@ -263,7 +287,7 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
 
       ddevCache = { timestamp: now, raw };
     } catch (error) {
-      console.error(`DDEV status check failed: ${error instanceof Error ? error.message : String(error)}`);
+      await log('error', `DDEV status check failed: ${error instanceof Error ? error.message : String(error)}`);
       ddevCache = null;
     }
   }
@@ -289,7 +313,7 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
     const containerWorkingDir = getContainerWorkingDir();
     const escapedCommand = JSON.stringify(cleanedCommand);
 
-    return `ddev exec --dir="${containerWorkingDir}" bash -c ${escapedCommand}`;
+    return `ddev exec --dir=${JSON.stringify(containerWorkingDir)} bash -c ${escapedCommand}`;
   };
 
   // Initialize DDEV detection
@@ -347,13 +371,7 @@ export const DDEVPlugin: Plugin = async ({ project, client, $, directory, worktr
 
       // Log if command was modified
       if (originalCommand !== wrappedCommand && !originalCommand.startsWith('ddev exec')) {
-        await client.app.log({
-          body: {
-            service: 'ddev-plugin',
-            level: 'debug',
-            message: `Wrapped command: ${originalCommand.substring(0, 80)}${originalCommand.length > 80 ? '...' : ''}`,
-          },
-        });
+        await log('debug', `Wrapped command: ${originalCommand.substring(0, 80)}${originalCommand.length > 80 ? '...' : ''}`);
       }
     },
 
