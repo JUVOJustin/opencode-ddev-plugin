@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "description": "Adds context about ddev setup and improves command calling",
-  "main": "ddev.js",
+  "main": "index.js",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JUVOJustin/opencode-ddev-plugin.git"
