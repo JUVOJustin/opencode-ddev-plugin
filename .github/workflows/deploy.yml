@@ -38,16 +38,13 @@ jobs:
         run: npm run build
 
       - name: Commit version update
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add package.json package-lock.json
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: update package.json version to ${{ steps.version.outputs.VERSION }}"
-            git push
-          fi
+        uses: test-room-7/action-update-file@v1
+        with:
+          file-path: |
+            package.json 
+            package-lock.json
+          commit-msg: "chore: update package.json version to ${{ steps.version.outputs.VERSION }}"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish to npm
         run: npm publish
